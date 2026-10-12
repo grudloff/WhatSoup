@@ -10,16 +10,29 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support.expected_conditions import presence_of_element_located
+from selenium.webdriver.support.expected_conditions import (presence_of_element_located,
+                                                            element_to_be_clickable)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import (TimeoutException, NoSuchElementException,
                                         StaleElementReferenceException,
-                                        ElementNotInteractableException)
+                                        ElementNotInteractableException,
+                                        ElementClickInterceptedException)
 from dotenv import load_dotenv
 
 import pandas as pd
 from whatsoup.utils import parse_datetime
+
+LAST_CHAT_ROW = "(//*[@id='pane-side']//div[@role='row'])[last()]"
+
+
+def xpath_literal(text: str) -> str:
+    """Quotes text as an XPath string literal, even when it contains both quote types."""
+    if "'" not in text:
+        return f"'{text}'"
+    if '"' not in text:
+        return f'"{text}"'
+    return "concat('" + "', \"'\", '".join(text.split("'")) + "')"
 
 class WhatsappClient():
     """
@@ -70,6 +83,10 @@ class WhatsappClient():
         options = webdriver.ChromeOptions()
         service = Service(executable_path=driver_path)
         options.add_argument(f"user-data-dir={chrome_profile}")
+        # WhatsApp Web silently refuses to link browsers that advertise automation
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
         if self.headless is True:
             options.add_argument("--headless")
         driver = webdriver.Chrome(service=service, options=options)
@@ -95,7 +112,21 @@ class WhatsappClient():
                           and let's try again.", wait_time)
             raise TimeoutError("WhatsApp did not load within the specified time.")
 
+        self.close_dialogs()
         logging.info("Success! WhatsApp finished loading and is ready.")
+
+    def close_dialogs(self) -> None:
+        """
+        Closes modal dialogs (e.g. "What's new on WhatsApp Web") that block clicks on the page.
+        """
+        sleep(2) # dialogs appear shortly after the chat list
+        for close_button in self.driver.find_elements(By.XPATH,
+                                                      "//div[@role='dialog']//button[@aria-label='Close']"):
+            try:
+                close_button.click()
+                logging.info("Closed a dialog.")
+            except (StaleElementReferenceException, ElementNotInteractableException):
+                pass
 
 
     def user_is_logged_in(self, wait_time: int) -> bool:
@@ -130,27 +161,13 @@ class WhatsappClient():
             query (str): The name or keyword to search for in the chat list.
         """
         logging.info("Searching the chat for user '%s'...", query)
-        logging.info("Typing the search query...")
-        retries = 3
-        for attempt in range(retries):
-            try:
-                left_panel = self.driver.find_element(By.ID, 'side')
-                chat_search = left_panel.find_element(By.CLASS_NAME, "lexical-rich-text-input")
-                chat_search.click()
-                ActionChains(self.driver).send_keys_to_element(chat_search, query).perform()
-                sleep(1)
-                break
-            except (StaleElementReferenceException, ElementNotInteractableException) as e:
-                if attempt < retries - 1:
-                    logging.warning("StaleElementReferenceException encountered while searching\
-                                    and clicking. Retrying... (%d/%d)", attempt + 1, retries)
-                    sleep(2)
-                else:
-                    logging.error("Could not find the chat search element after multiple attempts.")
-                    raise e
+        chat_search = WebDriverWait(self.driver, 10).until(element_to_be_clickable(
+            (By.XPATH, "//*[@id='side']//input[@role='textbox']")))
+        chat_search.click()
+        chat_search.send_keys(query)
 
         try:
-            WebDriverWait(self.driver, 5).until(
+            search_results = WebDriverWait(self.driver, 5).until(
                 presence_of_element_located((By.XPATH, "//*[@aria-label='Search results.']"))
             )
             logging.info("Search results found.")
@@ -162,20 +179,30 @@ class WhatsappClient():
         retries = 3
         for attempt in range(retries):
             try:
-                search_results = self.driver.find_element(By.XPATH,
-                                                          "//*[@aria-label='Search results.']")
-                selected_chat = search_results.find_element(By.XPATH,
-                                                            ".//div[@role='listitem'][2]")
-                selected_chat.click()
+                # Prefer the chat whose title matches exactly, else the first result
+                matches = search_results.find_elements(By.XPATH,
+                                                       f".//span[@title={xpath_literal(query)}]")
+                selected_chat = matches[0] if matches else search_results.find_element(
+                    By.XPATH, ".//div[@role='row']//span[@title]")
+                try:
+                    selected_chat.click()
+                except ElementClickInterceptedException:
+                    # e.g. the sticky "Chats" header of the results covers the first result
+                    self.driver.execute_script("arguments[0].click();", selected_chat)
+                WebDriverWait(self.driver, 10).until(
+                    presence_of_element_located((By.XPATH, "//*[@id='main']//div[@data-id]")))
                 logging.info("Chat selected.")
-            except (NoSuchElementException, StaleElementReferenceException) as e:
+                return
+            except (NoSuchElementException, StaleElementReferenceException, TimeoutException) as e:
                 if attempt < retries - 1:
-                    logging.warning("StaleElementReferenceException encountered while clicking the\
-                                     chat. Retrying... (%d/%d)", attempt + 1, retries)
+                    logging.warning("Could not open the chat. Retrying... (%d/%d)",
+                                    attempt + 1, retries)
                     sleep(2)
+                    search_results = self.driver.find_element(By.XPATH,
+                                                              "//*[@aria-label='Search results.']")
                 else:
-                    logging.error("'%s' chat could not be loaded in WhatsApp after 3 attempts.",
-                                  query)
+                    logging.error("'%s' chat could not be loaded in WhatsApp after %d attempts.",
+                                  query, retries)
                     raise e
 
     def load_selected_chat(self, number_target: Optional[int] = None) -> None:
@@ -194,51 +221,34 @@ class WhatsappClient():
         start = timer()
         logging.info("Loading messages...")
 
-        message_count = 0
-        current_message_count = len(self.driver.find_elements(By.XPATH, '//*[@role="row"]'))
-        counter = 0
-        while top_elem := self.driver.find_element(By.XPATH,
-                                                   '//*[@id="main"]/div[3]/div/div[2]/div[2]'):
-            if number_target and message_count >= number_target:
-                logging.info("Message number target reached.")
-                break
-            logging.info("Scrolling up...")
-            if current_message_count == message_count:
-                try:
-                    top_button = top_elem.find_element(By.XPATH, './/button')
-                except (NoSuchElementException, StaleElementReferenceException):
-                    top_button = False
-                if top_button:
-                    logging.info("Clicking the top button...")
-                    try:
-                        top_button.click()
-                        sleep(5) # wait for the messages to load
-                        current_message_count = len(self.driver.find_elements(By.XPATH,
-                                                                              '//*[@role="row"]'))
-                    except StaleElementReferenceException as exc:
-                        counter += 1
-                        if counter > 3:
-                            raise StaleElementReferenceException("StaleElementReferenceException\
-                                                                 encountered too many times.")\
-                                                                    from exc
-                else:
+        # WhatsApp loads older messages when the message list is scrolled to the top
+        scroll_to_top = """
+            let el = document.querySelector('#main div[data-id]');
+            while (el && !(el.scrollHeight > el.clientHeight &&
+                           ['auto', 'scroll'].includes(getComputedStyle(el).overflowY))) {
+                el = el.parentElement;
+            }
+            if (el) { el.scrollTop = 0; }
+        """
+        message_count = len(self.driver.find_elements(By.XPATH, "//*[@id='main']//div[@data-id]"))
+        stalls = 0
+        while not (number_target and message_count >= number_target):
+            self.driver.execute_script(scroll_to_top)
+            sleep(2) # wait for the messages to load
+            current_message_count = len(self.driver.find_elements(By.XPATH,
+                                                                  "//*[@id='main']//div[@data-id]"))
+            if current_message_count > message_count:
+                stalls = 0
+            else:
+                stalls += 1
+                if stalls >= 3:
                     logging.info("Reached the top of the chat!")
                     break
+            message_count = current_message_count
+        else:
+            logging.info("Message number target reached.")
 
-            try:
-                ActionChains(self.driver).scroll_to_element(top_elem).perform()
-                sleep(2) # wait for the messages to load
-                message_count = current_message_count
-                current_message_count = len(self.driver.find_elements(By.XPATH,
-                                                                      '//*[@role="row"]'))
-                counter = 0
-            except StaleElementReferenceException:
-                counter += 1
-                if counter > 3:
-                    raise StaleElementReferenceException("StaleElementReferenceException\
-                                                         encountered too many times.") from exc
-
-        logging.info("Success! Your entire chat history has been loaded in %d seconds.",
+        logging.info("Success! %d messages have been loaded in %d seconds.", message_count,
                      round(timer() - start))
 
     def scrape_chat(self) -> pd.DataFrame:
@@ -399,7 +409,7 @@ class WhatsappClient():
 
             result = []
             while True:
-                bottom_chat = self.driver.find_element(By.XPATH, "//div[@role='listitem'][last()]")
+                bottom_chat = self.driver.find_element(By.XPATH, LAST_CHAT_ROW)
                 soup = BeautifulSoup(left_panel.get_attribute('outerHTML'), 'lxml')
                 result += [chat['title'] for chat in soup.find_all('span', {'title': True,
                                                                            'dir': 'auto',
@@ -408,9 +418,7 @@ class WhatsappClient():
                 # wait for bottom_chat to change
                 try:
                     WebDriverWait(self.driver, 1).until(
-                        lambda driver: driver.find_element(By.XPATH,
-                                                           "//div[@role='listitem'][last()]")\
-                                                              != bottom_chat
+                        lambda driver: driver.find_element(By.XPATH, LAST_CHAT_ROW) != bottom_chat
                     )
                 except TimeoutException:
                     break
@@ -440,15 +448,14 @@ class WhatsappClient():
         try:
             self.load_whatsapp()
             logging.info("Retrieving user name...")
-            profile_button = self.driver.find_element(By.XPATH, "//button[@aria-label='Profile']")
+            profile_button = self.driver.find_element(By.XPATH, "//button[@aria-label='You']")
             profile_button.click()
+            # The "You" panel starts with the user's name, outside the chat list
             profile_name = WebDriverWait(self.driver, 10).until(
-                presence_of_element_located((By.XPATH, """//span[@dir='auto' and
-                                             contains(@class, 'selectable-text') and
-                                             contains(@class, 'copyable-text')]
-                                             //span[@class='']"""))
+                presence_of_element_located((By.XPATH, """//span[@dir='auto' and @title and
+                                             not(ancestor::*[@id='pane-side'])]"""))
             )
-            user_name = profile_name.text
+            user_name = profile_name.get_attribute('title')
             logging.info("Success! Retrieved user name: %s", user_name)
             return user_name
         except Exception as e:
